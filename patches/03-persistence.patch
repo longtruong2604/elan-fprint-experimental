@@ -1,0 +1,938 @@
+--- a/libfprint/experimental-sift/bridge.cpp
++++ b/libfprint/experimental-sift/bridge.cpp
+@@ -3,6 +3,9 @@
+ #include "elan0c4d-sift.hpp"
+ #include <cstddef>
+ #include <memory>
++#include <cmath>
++#include <cstring>
++#include <limits>
+ extern "C" {
+ unsigned elan_abi() noexcept { return 1; }
+ const char *elan_opencv() noexcept { return CV_VERSION; }
+@@ -19,3 +22,55 @@
+   catch (...) { return -1; }
+ }
+ }
++
++namespace {
++constexpr size_t point_bytes = 136;
++constexpr unsigned max_points = 2048;
++bool valid_point(const cv::Point2f &point, unsigned width, unsigned height) {
++  return std::isfinite(point.x) && std::isfinite(point.y) &&
++    point.x >= 0 && point.y >= 0 && point.x < 2.0 * width && point.y < 2.0 * height;
++}
++}
++extern "C" GBytes *elan_view_pack(const void *opaque, unsigned width, unsigned height) noexcept {
++  if (!opaque || !width || !height || width > 1000000 / height) return nullptr;
++  try {
++    const auto &view = *static_cast<const elan::View *>(opaque);
++    size_t count = view.points.size();
++    if (count < 8 || count > max_points || view.descriptors.type() != CV_8U ||
++        view.descriptors.rows != static_cast<int>(count) || view.descriptors.cols != 128) return nullptr;
++    std::vector<unsigned char> bytes(count * point_bytes);
++    for (size_t i = 0; i < count; i++) {
++      const auto &point = view.points[i];
++      if (!valid_point(point, width, height)) return nullptr;
++      guint32 x, y;
++      static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559, "SIFT persistence requires IEEE binary32");
++      std::memcpy(&x, &point.x, 4); std::memcpy(&y, &point.y, 4);
++      x = GUINT32_TO_LE(x); y = GUINT32_TO_LE(y);
++      std::memcpy(bytes.data() + i * point_bytes, &x, 4);
++      std::memcpy(bytes.data() + i * point_bytes + 4, &y, 4);
++      std::memcpy(bytes.data() + i * point_bytes + 8, view.descriptors.ptr(static_cast<int>(i)), 128);
++    }
++    return g_bytes_new(bytes.data(), bytes.size());
++  } catch (...) { return nullptr; }
++}
++extern "C" void *elan_view_unpack(const unsigned char *data, size_t length, unsigned width, unsigned height) noexcept {
++  if (!data || !width || !height || width > 1000000 / height ||
++      length % point_bytes || length / point_bytes < 8 || length / point_bytes > max_points) return nullptr;
++  try {
++    size_t count = length / point_bytes;
++    auto view = std::make_unique<elan::View>();
++    view->points.reserve(count);
++    view->descriptors = cv::Mat(static_cast<int>(count), 128, CV_8U);
++    for (size_t i = 0; i < count; i++) {
++      guint32 x, y;
++      std::memcpy(&x, data + i * point_bytes, 4); std::memcpy(&y, data + i * point_bytes + 4, 4);
++      x = GUINT32_FROM_LE(x); y = GUINT32_FROM_LE(y);
++      cv::Point2f point;
++      std::memcpy(&point.x, &x, 4); std::memcpy(&point.y, &y, 4);
++      if (!valid_point(point, width, height)) return nullptr;
++      view->points.push_back(point);
++      std::memcpy(view->descriptors.ptr(static_cast<int>(i)), data + i * point_bytes + 8, 128);
++    }
++    return view.release();
++  } catch (...) { return nullptr; }
++}
+--- a/libfprint/experimental-sift/bridge.h
++++ b/libfprint/experimental-sift/bridge.h
+@@ -1,12 +1,15 @@
+ // SPDX-License-Identifier: LGPL-2.1-or-later
+ #pragma once
+ #include <stddef.h>
++#include <glib.h>
+ #ifdef __cplusplus
+ #define ELAN_NOEXCEPT noexcept
+ extern "C" {
+ #else
+ #define ELAN_NOEXCEPT
+ #endif
++GBytes *elan_view_pack (const void *view, unsigned width, unsigned height) ELAN_NOEXCEPT;
++void *elan_view_unpack (const unsigned char *data, size_t length, unsigned width, unsigned height) ELAN_NOEXCEPT;
+ unsigned elan_abi (void) ELAN_NOEXCEPT;
+ const char *elan_opencv (void) ELAN_NOEXCEPT;
+ int elan_view_count (const void *view) ELAN_NOEXCEPT;
+--- a/libfprint/fp-print.c
++++ b/libfprint/fp-print.c
+@@ -600,6 +600,10 @@
+   if (self == other)
+     return TRUE;
+ 
++  if (fpi_sift_has_data (self) || fpi_sift_has_data (other))
++    return g_strcmp0 (self->driver, other->driver) == 0 &&
++      g_strcmp0 (self->device_id, other->device_id) == 0 && fpi_sift_equal (self, other);
++
+   if (self->type != other->type)
+     return FALSE;
+ 
+@@ -659,22 +663,23 @@
+                     GError **error)
+ {
+   g_autoptr(GVariant) result = NULL;
++  g_autoptr(GVariant) candidate = NULL;
+   GVariantBuilder builder = G_VARIANT_BUILDER_INIT (FPI_PRINT_VARIANT_TYPE);
+   gsize len;
+ 
+   g_assert (data);
+   g_assert (length);
+ 
++  *data = NULL;
++  *length = 0;
+   if (fpi_sift_has_data (print))
+     {
+-      *data = NULL;
+-      *length = 0;
+-      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+-                           "Experimental SIFT templates are process-local");
+-      return FALSE;
++      candidate = fpi_sift_serialize (print, error);
++      if (!candidate)
++        return FALSE;
+     }
+ 
+-  g_variant_builder_add (&builder, "i", print->type);
++  g_variant_builder_add (&builder, "i", candidate ? FPI_PRINT_RAW : print->type);
+   g_variant_builder_add (&builder, "s", print->driver);
+   g_variant_builder_add (&builder, "s", print->device_id);
+   g_variant_builder_add (&builder, "b", print->device_stored);
+@@ -693,7 +698,11 @@
+   g_variant_builder_close (&builder);
+ 
+   /* Insert NBIS print data for type NBIS, otherwise the GVariant directly */
+-  if (print->type == FPI_PRINT_NBIS)
++  if (candidate)
++    {
++      g_variant_builder_add (&builder, "v", g_variant_new_variant (candidate));
++    }
++  else if (print->type == FPI_PRINT_NBIS)
+     {
+       GVariantBuilder nested = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("(a(aiaiai))"));
+       guint i;
+@@ -751,8 +760,7 @@
+   (*data)[1] = (guchar) 'P';
+   (*data)[2] = (guchar) '3';
+ 
+-  g_variant_get_data (result);
+-  g_variant_store (result, (*data) + 3);
++  memcpy ((*data) + 3, g_variant_get_data (result), len - 3);
+ 
+   return TRUE;
+ }
+@@ -788,8 +796,8 @@
+   const gchar *device_id;
+   gboolean device_stored;
+ 
+-  g_assert (data);
+-  g_assert (length > 3);
++  if (!data || length <= 3 || length > FPI_SIFT_MAX_SERIALIZED + 4096)
++    goto invalid_format;
+ 
+   if (memcmp (data, "FP3", 3) != 0)
+     goto invalid_format;
+@@ -804,7 +812,7 @@
+   bytes = g_bytes_new (data + 3, length - 3);
+   raw_value = g_variant_new_from_bytes (FPI_PRINT_VARIANT_TYPE, bytes, FALSE);
+ 
+-  if (!raw_value)
++  if (!raw_value || !g_variant_is_normal_form (raw_value))
+     goto invalid_format;
+ 
+ #if (G_BYTE_ORDER == G_BIG_ENDIAN)
+@@ -833,8 +841,11 @@
+     {
+     case FPI_PRINT_NBIS:
+       {
+-        g_autoptr(GVariant) prints = g_variant_get_child_value (print_data, 0);
++        g_autoptr(GVariant) prints = NULL;
+         guint i;
++        if (!g_variant_is_of_type (print_data, G_VARIANT_TYPE ("(a(aiaiai))")))
++          goto invalid_format;
++        prints = g_variant_get_child_value (print_data, 0);
+ 
+         result = g_object_new (FP_TYPE_PRINT,
+                                "driver", driver,
+@@ -884,29 +895,54 @@
+ 
+     case FPI_PRINT_RAW:
+       {
+-        g_autoptr(GVariant) fp_data = g_variant_get_child_value (print_data, 0);
+-
+-        result = g_object_new (FP_TYPE_PRINT,
+-                               "fpi-type", type,
+-                               "driver", driver,
+-                               "device-id", device_id,
+-                               "device-stored", device_stored,
+-                               "fpi-data", fp_data,
+-                               NULL);
+-        g_object_ref_sink (result);
++        g_autoptr(GVariant) fp_data = NULL;
++        gboolean candidate = FALSE;
++        if (!g_variant_is_of_type (print_data, G_VARIANT_TYPE_VARIANT))
++          goto invalid_format;
++        fp_data = g_variant_get_child_value (print_data, 0);
++        if (g_variant_is_of_type (fp_data, G_VARIANT_TYPE ("(say)")))
++          {
++            g_autoptr(GVariant) tag = g_variant_get_child_value (fp_data, 0);
++            candidate = g_str_has_prefix (g_variant_get_string (tag, NULL), "elan-sift-");
++          }
++        if (candidate)
++          {
++            result = g_object_new (FP_TYPE_PRINT, "driver", driver,
++                                   "device-id", device_id, "device-stored", device_stored, NULL);
++            g_object_ref_sink (result);
++            fpi_print_set_type (result, FPI_PRINT_NBIS);
++            if (!fpi_sift_deserialize (result, fp_data, NULL))
++              goto invalid_format;
++          }
++        else
++          {
++            result = g_object_new (FP_TYPE_PRINT,
++                                   "fpi-type", type,
++                                   "driver", driver,
++                                   "device-id", device_id,
++                                   "device-stored", device_stored,
++                                   "fpi-data", fp_data,
++                                   NULL);
++            g_object_ref_sink (result);
++          }
+       }
+       break;
+ 
+     case FPI_PRINT_UNDEFINED:
+-      {
+-        g_autofree char *type_str = g_enum_to_string (fpi_print_type_get_type (), type);
+-        g_warning ("Invalid print type: 0x%X (%s)", type, type_str);
+-
+-        goto invalid_format;
+-      }
++    default:
++      goto invalid_format;
+     }
+ 
+-  date = g_date_new_julian (julian_date);
++  if (fpi_sift_has_data (result) &&
++      (finger_int8 > FP_FINGER_LAST || (username && strlen (username) > 256) ||
++       (description && strlen (description) > 512)))
++    goto invalid_format;
++
++  /* 23936166 is 65535-12-31, the largest year representable by GDateYear. */
++  if (julian_date != G_MININT32 &&
++      (julian_date <= 0 || julian_date > 23936166 || !g_date_valid_julian (julian_date)))
++    goto invalid_format;
++  date = julian_date == G_MININT32 ? g_date_new () : g_date_new_julian (julian_date);
+   g_object_set (result,
+                 "finger", finger,
+                 "username", username,
+--- a/libfprint/fpi-sift.c
++++ b/libfprint/fpi-sift.c
+@@ -3,6 +3,7 @@
+ #include "fpi-log.h"
+ #include "fpi-sift.h"
+ #include "fpi-image.h"
++#include <string.h>
+ 
+ #define SIFT_DATA "libfprint-experimental-sift-views-v1"
+ #define SIFT_ENABLED "libfprint-experimental-sift-enabled-v1"
+@@ -15,6 +16,8 @@
+ typedef struct {
+   grefcount refs;
+   void *features;
++  guint width;
++  guint height;
+ } SiftView;
+ 
+ static void
+@@ -53,6 +56,14 @@
+   g_object_set_data (G_OBJECT (device), SIFT_ENABLED, NULL);
+   if (g_strcmp0 (g_getenv ("LIBFPRINT_ELAN_SIFT"), "1") != 0)
+     return TRUE;
++#ifdef FPI_SIFT_TEST_BUILD
++  if (FP_DEVICE_GET_CLASS (device)->type == FP_DEVICE_TYPE_VIRTUAL &&
++      g_strcmp0 (fp_device_get_driver (device), "virtual_image") == 0)
++    {
++      g_object_set_data (G_OBJECT (device), SIFT_ENABLED, GINT_TO_POINTER (1));
++      return TRUE;
++    }
++#endif
+   if (FP_DEVICE_GET_CLASS (device)->type != FP_DEVICE_TYPE_USB)
+     goto unsupported;
+   usb = fpi_device_get_usb_device (device);
+@@ -125,16 +136,18 @@
+                            "Experimental SIFT extraction failed");
+       return FALSE;
+     }
+-  if (elan_view_count (features) < 8)
++  if (elan_view_count (features) < 8 || elan_view_count (features) > 2048)
+     {
+       elan_view_free (features);
+       g_set_error_literal (error, FP_DEVICE_RETRY, FP_DEVICE_RETRY_GENERAL,
+-                           "Insufficient experimental SIFT features; retry");
++                           "Experimental SIFT feature count outside supported bounds; retry");
+       return FALSE;
+     }
+   view = g_new0 (SiftView, 1);
+   g_ref_count_init (&view->refs);
+   view->features = features;
++  view->width = image->width;
++  view->height = image->height;
+   fpi_sift_begin (print);
+   views = g_object_get_data (G_OBJECT (print), SIFT_DATA);
+   g_ptr_array_add (views, view);
+@@ -168,10 +181,12 @@
+   gint best = 0;
+   SiftView *candidate;
+   if (!views || !views->len || views->len > MAX_VIEWS || !incoming || incoming->len != 1 ||
+-      !g_object_get_data (G_OBJECT (stored), SIFT_COMPLETE))
++      !g_object_get_data (G_OBJECT (stored), SIFT_COMPLETE) ||
++      g_strcmp0 (fp_print_get_driver (stored), fp_print_get_driver (probe)) != 0 ||
++      g_strcmp0 (fp_print_get_device_id (stored), fp_print_get_device_id (probe)) != 0)
+     {
+       g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+-                           "Experimental SIFT requires a live process-local template");
++                           "Experimental SIFT requires a complete compatible template");
+       return FPI_MATCH_ERROR;
+     }
+   candidate = g_ptr_array_index (incoming, 0);
+@@ -190,3 +205,160 @@
+   fp_dbg ("experimental SIFT score: %d, threshold: 8", best);
+   return best >= 8 ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
+ }
++
++
++guint
++fp_experimental_sift_persistence_abi (void)
++{
++  return 1;
++}
++
++guint
++fp_experimental_sift_test_build (void)
++{
++#ifdef FPI_SIFT_TEST_BUILD
++  return 1;
++#else
++  return 0;
++#endif
++}
++
++static gboolean
++persistent_identity (FpPrint *print)
++{
++  const gchar *id = fp_print_get_device_id (print);
++  const gchar *driver = fp_print_get_driver (print);
++  const gchar *username = fp_print_get_username (print);
++  const gchar *description = fp_print_get_description (print);
++  gboolean supported = g_strcmp0 (driver, "elan") == 0;
++#ifdef FPI_SIFT_TEST_BUILD
++  supported = supported || g_strcmp0 (driver, "virtual_image") == 0;
++#endif
++  return supported && id && *id && strlen (id) <= 128 && !fp_print_get_device_stored (print) &&
++    (!username || strlen (username) <= 256) && (!description || strlen (description) <= 512);
++}
++
++static void
++append_u32 (GByteArray *bytes, guint32 value)
++{
++  value = GUINT32_TO_LE (value);
++  g_byte_array_append (bytes, (const guint8 *) &value, 4);
++}
++
++static gboolean
++read_u32 (const guint8 **cursor, gsize *remaining, guint32 *value)
++{
++  if (*remaining < 4)
++    return FALSE;
++  memcpy (value, *cursor, 4);
++  *value = GUINT32_FROM_LE (*value);
++  *cursor += 4;
++  *remaining -= 4;
++  return TRUE;
++}
++
++GVariant *
++fpi_sift_serialize (FpPrint *print, GError **error)
++{
++  GPtrArray *views = g_object_get_data (G_OBJECT (print), SIFT_DATA);
++  g_autoptr(GByteArray) bytes = g_byte_array_new ();
++  if (!persistent_identity (print) || !views || !views->len || views->len > MAX_VIEWS ||
++      !g_object_get_data (G_OBJECT (print), SIFT_COMPLETE))
++    goto invalid;
++  g_byte_array_append (bytes, (const guint8 *) "ELSIFT01", 8);
++  append_u32 (bytes, 1);
++  append_u32 (bytes, 0x04f3);
++  append_u32 (bytes, 0x0c4d);
++  append_u32 (bytes, 0x0187);
++  append_u32 (bytes, views->len);
++  for (guint i = 0; i < views->len; i++)
++    {
++      SiftView *view = g_ptr_array_index (views, i);
++      g_autoptr(GBytes) encoded = elan_view_pack (view->features, view->width, view->height);
++      gsize length;
++      const guint8 *data;
++      if (!encoded)
++        goto invalid;
++      data = g_bytes_get_data (encoded, &length);
++      if (length > FPI_SIFT_MAX_SERIALIZED - bytes->len - 12)
++        goto invalid;
++      append_u32 (bytes, view->width);
++      append_u32 (bytes, view->height);
++      append_u32 (bytes, length / 136);
++      g_byte_array_append (bytes, data, length);
++    }
++  return g_variant_ref_sink (g_variant_new ("(s@ay)", FPI_SIFT_TAG,
++    g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, bytes->data, bytes->len, 1)));
++invalid:
++  g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
++                       "Invalid or incomplete experimental SIFT template");
++  return NULL;
++}
++
++gboolean
++fpi_sift_deserialize (FpPrint *print, GVariant *data, GError **error)
++{
++  g_autoptr(GVariant) payload = NULL;
++  g_autoptr(GPtrArray) views = g_ptr_array_new_with_free_func (view_unref);
++  const gchar *tag;
++  const guint8 *cursor;
++  gsize remaining;
++  guint32 version, vid, pid, revision, count;
++  if (!persistent_identity (print) || !g_variant_is_of_type (data, G_VARIANT_TYPE ("(say)")))
++    goto invalid;
++  g_variant_get (data, "(&s@ay)", &tag, &payload);
++  cursor = g_variant_get_fixed_array (payload, &remaining, 1);
++  if (g_strcmp0 (tag, FPI_SIFT_TAG) != 0 || remaining < 28 || remaining > FPI_SIFT_MAX_SERIALIZED ||
++      memcmp (cursor, "ELSIFT01", 8) != 0)
++    goto invalid;
++  cursor += 8; remaining -= 8;
++  if (!read_u32 (&cursor, &remaining, &version) || version != 1 ||
++      !read_u32 (&cursor, &remaining, &vid) || vid != 0x04f3 ||
++      !read_u32 (&cursor, &remaining, &pid) || pid != 0x0c4d ||
++      !read_u32 (&cursor, &remaining, &revision) || revision != 0x0187 ||
++      !read_u32 (&cursor, &remaining, &count) || !count || count > MAX_VIEWS)
++    goto invalid;
++  for (guint i = 0; i < count; i++)
++    {
++      guint32 width, height, points;
++      SiftView *view;
++      void *features;
++      gsize length;
++      if (!read_u32 (&cursor, &remaining, &width) || !read_u32 (&cursor, &remaining, &height) ||
++          !read_u32 (&cursor, &remaining, &points) || points < 8 || points > 2048)
++        goto invalid;
++      length = (gsize) points * 136;
++      if (length > remaining)
++        goto invalid;
++      features = elan_view_unpack (cursor, length, width, height);
++      if (!features)
++        goto invalid;
++      view = g_new0 (SiftView, 1);
++      g_ref_count_init (&view->refs);
++      view->features = features; view->width = width; view->height = height;
++      g_ptr_array_add (views, view);
++      cursor += length; remaining -= length;
++    }
++  if (remaining)
++    goto invalid;
++  g_object_set_data_full (G_OBJECT (print), SIFT_DATA, g_steal_pointer (&views),
++                          (GDestroyNotify) g_ptr_array_unref);
++  g_object_set_data (G_OBJECT (print), SIFT_COMPLETE, GINT_TO_POINTER (1));
++  return TRUE;
++invalid:
++  g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
++                       "Invalid experimental SIFT template format");
++  return FALSE;
++}
++
++gboolean
++fpi_sift_equal (FpPrint *self, FpPrint *other)
++{
++  g_autoptr(GVariant) first = NULL;
++  g_autoptr(GVariant) second = NULL;
++  if (!fpi_sift_has_data (self) || !fpi_sift_has_data (other))
++    return FALSE;
++  first = fpi_sift_serialize (self, NULL);
++  second = fpi_sift_serialize (other, NULL);
++  return first && second && g_variant_equal (first, second);
++}
+--- a/libfprint/fpi-sift.h
++++ b/libfprint/fpi-sift.h
+@@ -3,6 +3,13 @@
+ #include "fpi-device.h"
+ #include "fpi-print.h"
+ 
++#define FPI_SIFT_TAG "elan-sift-v1"
++#define FPI_SIFT_MAX_SERIALIZED (6 * 1024 * 1024)
++guint fp_experimental_sift_test_build (void);
++guint fp_experimental_sift_persistence_abi (void);
++GVariant *fpi_sift_serialize (FpPrint *print, GError **error);
++gboolean fpi_sift_deserialize (FpPrint *print, GVariant *data, GError **error);
++gboolean fpi_sift_equal (FpPrint *self, FpPrint *other);
+ guint fp_experimental_sift_abi (void);
+ gboolean fpi_sift_hardware_supported (const gchar *driver, guint vid, guint pid, guint revision);
+ gboolean fpi_sift_configure (FpDevice *device, GError **error);
+--- a/meson.build
++++ b/meson.build
+@@ -8,6 +8,10 @@
+     ],
+     meson_version: '>= 0.62.0')
+ 
++if get_option('experimental-sift-test')
++  add_project_arguments('-DFPI_SIFT_TEST_BUILD=1', language: 'c')
++endif
++
+ fs = import('fs')
+ gnome = import('gnome')
+ 
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -34,3 +34,5 @@
+        description: 'Whether to install the installed tests',
+        type: 'boolean',
+        value: true)
++
++option('experimental-sift-test', type: 'boolean', value: false, description: 'TEST ONLY: permit virtual SIFT reader; never use for hardware')
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -29,6 +29,7 @@
+ if get_option('introspection') and 'virtual_image' in drivers
+   sift_envs = envs
+   sift_envs.prepend('GI_TYPELIB_PATH', meson.project_build_root() / 'libfprint')
++  if not get_option('experimental-sift-test')
+   test('sift-image', python3,
+     args: files('sift-image.py'),
+     suite: ['experimental-sift'],
+@@ -36,6 +37,16 @@
+     timeout: 60,
+     depends: [libfprint_typelib],
+   )
++  else
++    sift_envs.set('LIBFPRINT_ELAN_SIFT', '1')
++    test('sift-persist-image', python3,
++      args: files('sift-persist-image.py'),
++      suite: ['experimental-sift'],
++      env: sift_envs,
++      timeout: 60,
++      depends: [libfprint_typelib],
++    )
++  endif
+ endif
+ 
+ installed_tests = get_option('installed-tests')
+@@ -321,6 +332,7 @@
+     install: false)
+ 
+ unit_tests = [
++    'fpi-sift-persist',
+     'fpi-sift',
+     'fpi-device',
+     'fpi-ssm',
+--- a/tests/sift-image.py
++++ b/tests/sift-image.py
+@@ -27,7 +27,7 @@
+         enrolled = self.enroll_print('whorl')
+         with self.assertRaises(GLib.Error) as caught:
+             enrolled.serialize()
+-        self.assertTrue(caught.exception.matches(Gio.io_error_quark(), Gio.IOErrorEnum.NOT_SUPPORTED))
++        self.assertTrue(caught.exception.matches(Gio.io_error_quark(), Gio.IOErrorEnum.INVALID_DATA))
+ 
+     def verify_scan(self, template, image):
+         result = []
+--- /dev/null
++++ b/tests/sift-persist-image.py
+@@ -0,0 +1,31 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: LGPL-2.1-or-later
++import ctypes
++import importlib.util
++import unittest
++from pathlib import Path
++
++spec = importlib.util.spec_from_file_location('sift_image_tests', Path(__file__).with_name('sift-image.py'))
++sift = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(sift)
++
++class PersistentSiftImage(sift.SiftImage):
++    def setUp(self):
++        library = ctypes.CDLL('libfprint-2.so.2')
++        self.assertEqual(library.fp_experimental_sift_test_build(), 1)
++        sift.virtual.VirtualImage.setUp(self)
++
++    def test_persistent_enroll_reload(self):
++        enrolled = self.enroll_print('whorl')
++        serialized = enrolled.serialize()
++        restored = sift.FPrint.Print.deserialize(serialized)
++        self.assertTrue(enrolled.equal(restored))
++        self.assertEqual(restored.get_username(), 'testuser')
++        self.assertTrue(self.verify_scan(restored, 'whorl')[0])
++        self.assertFalse(self.verify_scan(restored, 'tented_arch')[0])
++
++if __name__ == '__main__':
++    suite = unittest.TestSuite(PersistentSiftImage(name) for name in (
++        'test_persistent_enroll_reload', 'test_cancel_then_close', 'test_verify_cancel'))
++    result = unittest.TextTestRunner(verbosity=2).run(suite)
++    raise SystemExit(not result.wasSuccessful())
+--- /dev/null
++++ b/tests/test-fpi-sift-persist.c
+@@ -0,0 +1,319 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "fpi-sift.h"
++#include "fpi-image.h"
++#include "fp-print-private.h"
++#include <glib/gstdio.h>
++#include <unistd.h>
++#include <string.h>
++
++static FpPrint *
++identity_print (const gchar *driver, const gchar *id)
++{
++  FpPrint *print = g_object_new (FP_TYPE_PRINT, "driver", driver, "device-id", id, NULL);
++  g_object_ref_sink (print);
++  fpi_print_set_type (print, FPI_PRINT_NBIS);
++  return print;
++}
++
++static FpPrint *
++scan (guint seed)
++{
++  FpPrint *print = identity_print ("elan", "0");
++  g_autoptr(FpImage) image = fp_image_new (150, 100);
++  GRand *rng = g_rand_new_with_seed (seed);
++  g_autoptr(GError) error = NULL;
++  for (guint i = 0; i < 150 * 100; i++)
++    image->data[i] = g_rand_int_range (rng, 0, 256);
++  g_rand_free (rng);
++  g_assert_true (fpi_sift_add_image (print, image, &error));
++  g_assert_no_error (error);
++  return print;
++}
++
++static FpPrint *
++enrolled (guint seed)
++{
++  FpPrint *print = identity_print ("elan", "0");
++  g_autoptr(FpPrint) source = scan (seed);
++  fpi_sift_begin (print);
++  for (guint i = 0; i < 5; i++)
++    g_assert_true (fpi_sift_append (print, source, NULL));
++  g_assert_true (fpi_sift_complete (print, 5, NULL));
++  g_object_set (print, "username", "synthetic-test", "finger", FP_FINGER_RIGHT_INDEX,
++                "description", "Synthetic feature fixture", NULL);
++  return print;
++}
++
++static void
++test_roundtrip (void)
++{
++  g_autoptr(FpPrint) original = enrolled (123);
++  g_autoptr(FpPrint) genuine = scan (123);
++  g_autoptr(FpPrint) control = scan (456);
++  g_autoptr(FpPrint) restored = NULL;
++  g_autofree guchar *bytes = NULL;
++  gsize length = 0;
++  g_autoptr(GError) error = NULL;
++  g_assert_true (fp_print_serialize (original, &bytes, &length, &error));
++  restored = fp_print_deserialize (bytes, length, &error);
++  g_assert_no_error (error);
++  g_assert_true (fp_print_equal (original, restored));
++  g_assert_cmpstr (fp_print_get_username (restored), ==, "synthetic-test");
++  g_assert_cmpstr (fp_print_get_description (restored), ==, "Synthetic feature fixture");
++  g_assert_cmpint (fp_print_get_finger (restored), ==, FP_FINGER_RIGHT_INDEX);
++  g_assert_cmpint (fpi_sift_match (restored, genuine, &error), ==, FPI_MATCH_SUCCESS);
++  g_assert_cmpint (fpi_sift_match (restored, control, &error), ==, FPI_MATCH_FAIL);
++  g_assert_false (fp_print_equal (restored, control));
++  g_assert_no_error (error);
++}
++
++static void
++test_partial_rejected (void)
++{
++  g_autoptr(FpPrint) print = scan (123);
++  g_autoptr(GError) error = NULL;
++  g_autofree guchar *bytes = NULL;
++  gsize length = 0;
++  g_assert_false (fp_print_serialize (print, &bytes, &length, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
++  g_assert_null (bytes);
++  g_assert_cmpuint (length, ==, 0);
++}
++
++static GVariant *
++payload_variant (const guint8 *bytes, gsize length, const gchar *tag)
++{
++  return g_variant_ref_sink (g_variant_new ("(s@ay)", tag,
++    g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, bytes, length, 1)));
++}
++
++static void
++assert_payload_invalid (const guint8 *bytes, gsize length, const gchar *tag)
++{
++  g_autoptr(FpPrint) print = identity_print ("elan", "0");
++  g_autoptr(GVariant) data = payload_variant (bytes, length, tag);
++  g_autoptr(GError) error = NULL;
++  g_assert_false (fpi_sift_deserialize (print, data, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
++  g_assert_false (fpi_sift_has_data (print));
++}
++
++static void
++test_malformed_payloads (void)
++{
++  g_autoptr(FpPrint) print = enrolled (123);
++  g_autoptr(GVariant) data = fpi_sift_serialize (print, NULL);
++  g_autoptr(GVariant) array = g_variant_get_child_value (data, 1);
++  gsize length;
++  const guint8 *bytes = g_variant_get_fixed_array (array, &length, 1);
++  g_autofree guint8 *mutated = g_memdup2 (bytes, length);
++  const guint offsets[] = {0, 8, 12, 16, 20, 24, 28, 32, 36};
++  for (guint i = 0; i < G_N_ELEMENTS (offsets); i++)
++    {
++      memcpy (mutated, bytes, length);
++      memset (mutated + offsets[i], 0xff, 4);
++      assert_payload_invalid (mutated, length, FPI_SIFT_TAG);
++    }
++  memcpy (mutated, bytes, length);
++  memset (mutated + 24, 0, 4);
++  assert_payload_invalid (mutated, length, FPI_SIFT_TAG);
++  memcpy (mutated, bytes, length);
++  memset (mutated + 36, 0, 4);
++  assert_payload_invalid (mutated, length, FPI_SIFT_TAG);
++  memcpy (mutated, bytes, length);
++  mutated[40] = 0; mutated[41] = 0; mutated[42] = 0xc0; mutated[43] = 0x7f;
++  assert_payload_invalid (mutated, length, FPI_SIFT_TAG);
++  memcpy (mutated, bytes, length);
++  mutated[40] = 0; mutated[41] = 0; mutated[42] = 0x80; mutated[43] = 0x7f;
++  assert_payload_invalid (mutated, length, FPI_SIFT_TAG);
++  memcpy (mutated, bytes, length);
++  mutated[43] |= 0x80;
++  assert_payload_invalid (mutated, length, FPI_SIFT_TAG);
++  for (guint i = 0; i < 50; i++)
++    assert_payload_invalid (bytes, i, FPI_SIFT_TAG);
++  assert_payload_invalid (bytes, length - 1, FPI_SIFT_TAG);
++  g_autofree guint8 *trailing = g_malloc0 (length + 1);
++  memcpy (trailing, bytes, length);
++  assert_payload_invalid (trailing, length + 1, FPI_SIFT_TAG);
++  assert_payload_invalid (bytes, length, "elan-sift-v2");
++  g_autofree guint8 *oversized = g_malloc0 (FPI_SIFT_MAX_SERIALIZED + 1);
++  assert_payload_invalid (oversized, FPI_SIFT_MAX_SERIALIZED + 1, FPI_SIFT_TAG);
++}
++
++static void
++test_foreign_identity (void)
++{
++  g_autoptr(FpPrint) print = enrolled (123);
++  g_autoptr(FpPrint) foreign = identity_print ("other-driver", "0");
++  g_autoptr(GVariant) data = fpi_sift_serialize (print, NULL);
++  g_autoptr(GError) error = NULL;
++  g_assert_false (fpi_sift_deserialize (foreign, data, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
++  g_clear_error (&error);
++  g_clear_object (&foreign);
++  foreign = identity_print ("elan", "different-device");
++  g_assert_true (fpi_sift_deserialize (foreign, data, &error));
++  g_autoptr(FpPrint) probe = scan (123);
++  g_assert_cmpint (fpi_sift_match (foreign, probe, &error), ==, FPI_MATCH_ERROR);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++}
++
++static void
++test_envelope_fuzz (void)
++{
++  GRand *rng = g_rand_new_with_seed (991);
++  for (guint n = 0; n < 512; n++)
++    {
++      gsize length = n;
++      g_autofree guint8 *bytes = g_malloc0 (MAX (length, 4));
++      g_autoptr(GError) error = NULL;
++      g_autoptr(FpPrint) print = NULL;
++      for (guint i = 0; i < length; i++)
++        bytes[i] = g_rand_int_range (rng, 0, 256);
++      if (length > 3 && n % 2)
++        memcpy (bytes, "FP3", 3);
++      print = fp_print_deserialize (bytes, length, &error);
++      g_assert_null (print);
++      g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
++    }
++  g_rand_free (rng);
++}
++
++static void
++test_cross_process (void)
++{
++  if (g_test_subprocess ())
++    {
++      g_autofree gchar *bytes = NULL;
++      gsize length;
++      g_autoptr(GError) error = NULL;
++      g_autoptr(FpPrint) restored = NULL;
++      g_autoptr(FpPrint) probe = scan (123);
++      g_assert_true (g_file_get_contents (g_getenv ("SIFT_SYNTHETIC_TEST_FILE"), &bytes, &length, &error));
++      restored = fp_print_deserialize ((guchar *) bytes, length, &error);
++      g_assert_nonnull (restored);
++      g_assert_cmpint (fpi_sift_match (restored, probe, &error), ==, FPI_MATCH_SUCCESS);
++      return;
++    }
++  g_autoptr(FpPrint) print = enrolled (123);
++  g_autofree guchar *bytes = NULL;
++  g_autofree gchar *path = NULL;
++  gsize length;
++  gint fd = g_file_open_tmp ("sift-synthetic-XXXXXX", &path, NULL);
++  g_assert_cmpint (fd, >=, 0);
++  close (fd);
++  g_assert_true (fp_print_serialize (print, &bytes, &length, NULL));
++  g_assert_true (g_file_set_contents (path, (gchar *) bytes, length, NULL));
++  g_setenv ("SIFT_SYNTHETIC_TEST_FILE", path, TRUE);
++  g_test_trap_subprocess (NULL, 10 * G_USEC_PER_SEC, 0);
++  g_unlink (path);
++  g_unsetenv ("SIFT_SYNTHETIC_TEST_FILE");
++  g_test_trap_assert_passed ();
++}
++
++static void
++test_structured_envelope_rejected (void)
++{
++  for (guint i = 0; i < 4; i++)
++    {
++      GVariant *nested = i == 0 ? g_variant_new_string ("wrong NBIS payload") :
++                         i == 1 ? g_variant_new_uint32 (42) :
++                         g_variant_new_variant (g_variant_new_string ("unrecognized"));
++      gint type = i == 0 ? FPI_PRINT_NBIS : i == 1 ? FPI_PRINT_RAW : i == 2 ? 99 : FPI_PRINT_UNDEFINED;
++      g_autoptr(GVariant) envelope = g_variant_ref_sink (g_variant_new (
++        "(issbymsmsi@a{sv}v)", type, "elan", "0", FALSE, 2,
++        NULL, NULL, G_MININT32, g_variant_new_array (G_VARIANT_TYPE ("{sv}"), NULL, 0), nested));
++      gsize length = g_variant_get_size (envelope) + 3;
++      g_autofree guint8 *bytes = g_malloc (length);
++      g_autoptr(GError) error = NULL;
++      g_autoptr(FpPrint) restored = NULL;
++      memcpy (bytes, "FP3", 3);
++      memcpy (bytes + 3, g_variant_get_data (envelope), length - 3);
++      restored = fp_print_deserialize (bytes, length, &error);
++      g_assert_null (restored);
++      g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
++    }
++}
++
++static void
++test_testbuild_identity (void)
++{
++  g_autoptr(FpPrint) original = enrolled (123);
++  g_autoptr(GVariant) data = fpi_sift_serialize (original, NULL);
++  g_autoptr(FpPrint) virtual_print = identity_print ("virtual_image", "0");
++  g_autoptr(GError) error = NULL;
++  g_assert_cmpuint (fp_experimental_sift_persistence_abi (), ==, 1);
++#ifdef FPI_SIFT_TEST_BUILD
++  g_assert_cmpuint (fp_experimental_sift_test_build (), ==, 1);
++  g_assert_true (fpi_sift_deserialize (virtual_print, data, &error));
++  g_assert_no_error (error);
++#else
++  g_assert_cmpuint (fp_experimental_sift_test_build (), ==, 0);
++  g_assert_false (fpi_sift_deserialize (virtual_print, data, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
++#endif
++}
++
++static void
++test_metadata_validation (void)
++{
++  g_autoptr(FpPrint) original = enrolled (123);
++  g_autofree guint8 *serialized = NULL;
++  gsize length;
++  g_assert_true (fp_print_serialize (original, &serialized, &length, NULL));
++  g_autoptr(GBytes) backing = g_bytes_new (serialized + 3, length - 3);
++  g_autoptr(GVariant) envelope = g_variant_ref_sink (g_variant_new_from_bytes (
++    G_VARIANT_TYPE ("(issbymsmsia{sv}v)"), backing, FALSE));
++  const gint dates[] = {0, -1, -2, G_MININT32, 1, G_MAXINT32, G_MININT32, G_MININT32, 23936166, 23936167};
++  const guint8 fingers[] = {2, 2, 2, 2, 2, 2, 0, 255, 2, 2};
++  for (guint i = 0; i < G_N_ELEMENTS (dates); i++)
++    {
++      GVariantBuilder builder;
++      g_variant_builder_init (&builder, g_variant_get_type (envelope));
++      for (guint field = 0; field < 10; field++)
++        {
++          g_autoptr(GVariant) value = NULL;
++          if (field == 4)
++            value = g_variant_ref_sink (g_variant_new_byte (fingers[i]));
++          else if (field == 7)
++            value = g_variant_ref_sink (g_variant_new_int32 (dates[i]));
++          else
++            value = g_variant_get_child_value (envelope, field);
++          g_variant_builder_add_value (&builder, value);
++        }
++      g_autoptr(GVariant) changed = g_variant_ref_sink (g_variant_builder_end (&builder));
++      gsize changed_length = g_variant_get_size (changed) + 3;
++      g_autofree guint8 *bytes = g_malloc (changed_length);
++      memcpy (bytes, "FP3", 3);
++      memcpy (bytes + 3, g_variant_get_data (changed), changed_length - 3);
++      g_autoptr(GError) error = NULL;
++      g_autoptr(FpPrint) restored = fp_print_deserialize (bytes, changed_length, &error);
++      if (i < 3 || i == 5 || i == 7 || i == 9)
++        {
++          g_assert_null (restored);
++          g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
++        }
++      else
++        {
++          g_assert_nonnull (restored);
++          g_assert_no_error (error);
++          if (dates[i] == G_MININT32)
++            g_assert_false (g_date_valid (fp_print_get_enroll_date (restored)));
++        }
++    }
++}
++
++int main (int argc, char **argv)
++{
++  g_test_init (&argc, &argv, NULL);
++  g_test_add_func ("/persist/roundtrip", test_roundtrip);
++  g_test_add_func ("/persist/metadata", test_metadata_validation);
++  g_test_add_func ("/persist/structured-envelope", test_structured_envelope_rejected);
++  g_test_add_func ("/persist/testbuild-identity", test_testbuild_identity);
++  g_test_add_func ("/persist/partial", test_partial_rejected);
++  g_test_add_func ("/persist/malformed", test_malformed_payloads);
++  g_test_add_func ("/persist/foreign", test_foreign_identity);
++  g_test_add_func ("/persist/envelope-fuzz", test_envelope_fuzz);
++  g_test_add_func ("/persist/cross-process", test_cross_process);
++  return g_test_run ();
++}
+--- a/tests/test-fpi-sift.c
++++ b/tests/test-fpi-sift.c
+@@ -106,7 +106,7 @@
+   gsize length = 0;
+   fpi_sift_begin (print);
+   g_assert_false (fp_print_serialize (print, &data, &length, &error));
+-  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED);
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
+   g_assert_null (data);
+   g_assert_cmpuint (length, ==, 0);
+ }

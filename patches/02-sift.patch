@@ -1,0 +1,1010 @@
+--- a/libfprint/drivers/elan.c
++++ b/libfprint/drivers/elan.c
+@@ -38,6 +38,7 @@
+ 
+ #define FP_COMPONENT "elan"
+ 
++#include "fpi-sift.h"
+ #include "drivers_api.h"
+ #include "elan.h"
+ 
+@@ -879,6 +880,12 @@
+       self->fw_ver =
+         (self->last_read[0] << 8 | self->last_read[1]);
+       fp_dbg ("FW ver 0x%04hx", self->fw_ver);
++      if (fpi_sift_enabled (dev) && self->fw_ver != 0x0187)
++        {
++          fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
++                               "Experimental SIFT requires firmware 0187"));
++          break;
++        }
+       fpi_ssm_next_state (ssm);
+       break;
+ 
+--- /dev/null
++++ b/libfprint/experimental-sift/bridge.cpp
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "bridge.h"
++#include "elan0c4d-sift.hpp"
++#include <cstddef>
++#include <memory>
++extern "C" {
++unsigned elan_abi() noexcept { return 1; }
++const char *elan_opencv() noexcept { return CV_VERSION; }
++int elan_view_count(const void *view) noexcept { return view ? static_cast<const elan::View *>(view)->points.size() : -1; }
++void *elan_view_new(const unsigned char *data, size_t length, unsigned width, unsigned height) noexcept {
++  if (!data || !width || !height || width > 1000000 / height || length != size_t(width)*height) return nullptr;
++  try { return new elan::View(elan::features(data,width,height)); }
++  catch (...) { return nullptr; }
++}
++void elan_view_free(void *view) noexcept { delete static_cast<elan::View *>(view); }
++int elan_view_score(const void *probe, const void *stored) noexcept {
++  if (!probe || !stored) return -1;
++  try { return elan::consistent_matches(*static_cast<const elan::View *>(probe), *static_cast<const elan::View *>(stored)); }
++  catch (...) { return -1; }
++}
++}
+--- /dev/null
++++ b/libfprint/experimental-sift/bridge.h
+@@ -0,0 +1,18 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#pragma once
++#include <stddef.h>
++#ifdef __cplusplus
++#define ELAN_NOEXCEPT noexcept
++extern "C" {
++#else
++#define ELAN_NOEXCEPT
++#endif
++unsigned elan_abi (void) ELAN_NOEXCEPT;
++const char *elan_opencv (void) ELAN_NOEXCEPT;
++int elan_view_count (const void *view) ELAN_NOEXCEPT;
++void *elan_view_new (const unsigned char *data, size_t length, unsigned width, unsigned height) ELAN_NOEXCEPT;
++void elan_view_free (void *view) ELAN_NOEXCEPT;
++int elan_view_score (const void *probe, const void *stored) ELAN_NOEXCEPT;
++#ifdef __cplusplus
++}
++#endif
+--- /dev/null
++++ b/libfprint/experimental-sift/elan0c4d-sift.hpp
+@@ -0,0 +1,35 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// Keypoint comparator shared by elan0c4d-sift*.cpp: SIFT on the enhanced
++// image and a RANSAC similarity check, measured on real 0c4d touches.
++#pragma once
++
++#include <glib.h>
++#include <opencv2/core.hpp>
++#include <stdexcept>
++#include <vector>
++
++namespace elan
++{
++
++// One touch: where its keypoints are and their 128-byte SIFT descriptors.
++struct View
++{
++  std::vector<cv::Point2f> points;
++  cv::Mat descriptors;  // CV_8U, one row per point
++};
++
++// A stored template that is truncated, foreign or inconsistent.
++struct TemplateError : std::runtime_error
++{
++  using std::runtime_error::runtime_error;
++};
++
++View features (const guint8 *image, guint width, guint height);
++
++// Matches that agree on one rotation + shift (+-15 % scale); 0 if none does.
++int consistent_matches (const View &probe, const View &stored);
++
++GBytes *pack (const std::vector<View> &views);
++std::vector<View> unpack (GBytes *tmpl);
++
++}  // namespace elan
+--- /dev/null
++++ b/libfprint/experimental-sift/reference-sift.cpp
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++// Features and geometric check. Values chosen on 25 touches of one finger and
++// 10 of another (2026-10-13): impostor pairs never exceeded 3 consistent
++// matches, genuine touches that overlap an enrolled one gave 11 or more.
++#include <mutex>
++#include <opencv2/calib3d.hpp>
++#include <opencv2/features2d.hpp>
++#include <opencv2/imgproc.hpp>
++#include "elan0c4d-sift.hpp"
++
++namespace
++{
++constexpr double kClaheClip = 2.0;       // local contrast, tiles of a quarter of the width
++constexpr int kClaheTiles = 4;
++constexpr double kUpscale = 2.0;         // ridges are ~4.5 px apart: SIFT needs more room
++constexpr double kContrast = 0.01;       // keeps the weak keypoints of a small sensor
++constexpr float kRatio = 0.75f;          // Lowe's ratio test
++constexpr double kRansacPx = 4.0;        // reprojection tolerance in upscaled pixels
++constexpr double kScaleTolerance = 0.15; // the finger is pressed, not zoomed
++constexpr int kMaxKeypoints = 1000;      // real touches give 139-280
++
++std::once_flag single_thread;
++}  // namespace
++
++namespace elan
++{
++
++View
++features (const guint8 *image, guint width, guint height)
++{
++  // fprintd is a single-threaded daemon: no OpenCV worker pool inside it.
++  std::call_once (single_thread, [] { cv::setNumThreads (1); });
++  cv::Mat img (static_cast<int> (height), static_cast<int> (width), CV_8U, const_cast<guint8 *> (image));
++  cv::Mat enhanced, big;
++  cv::createCLAHE (kClaheClip, cv::Size (kClaheTiles, kClaheTiles))->apply (img, enhanced);
++  cv::resize (enhanced, big, cv::Size (), kUpscale, kUpscale, cv::INTER_CUBIC);
++
++  std::vector<cv::KeyPoint> keypoints;
++  cv::Mat descriptors;
++  cv::SIFT::create (kMaxKeypoints, 3, kContrast)->detectAndCompute (big, cv::noArray (), keypoints, descriptors);
++
++  View view;
++  cv::KeyPoint::convert (keypoints, view.points);
++  if (!descriptors.empty ())
++    descriptors.convertTo (view.descriptors, CV_8U);  // SIFT values are integers 0..255
++  return view;
++}
++
++int
++consistent_matches (const View &probe, const View &stored)
++{
++  if (probe.descriptors.rows < 3 || stored.descriptors.rows < 3)
++    return 0;
++  cv::Mat a, b;
++  probe.descriptors.convertTo (a, CV_32F);
++  stored.descriptors.convertTo (b, CV_32F);
++
++  std::vector<std::vector<cv::DMatch>> pairs;
++  cv::BFMatcher (cv::NORM_L2).knnMatch (a, b, pairs, 2);
++  std::vector<cv::Point2f> from, to;
++  for (const auto &p : pairs)
++    if (p.size () == 2 && p[0].distance < kRatio * p[1].distance)
++      {
++        from.push_back (probe.points[p[0].queryIdx]);
++        to.push_back (stored.points[p[0].trainIdx]);
++      }
++  if (from.size () < 3)
++    return 0;
++
++  std::vector<uchar> inliers;
++  cv::Mat m = cv::estimateAffinePartial2D (from, to, inliers, cv::RANSAC, kRansacPx);
++  if (m.empty ())
++    return 0;
++  double scale = std::hypot (m.at<double> (0, 0), m.at<double> (0, 1));
++  if (std::abs (scale - 1.0) > kScaleTolerance)
++    return 0;
++  return cv::countNonZero (inliers);
++}
++
++}  // namespace elan
++
+--- a/libfprint/fp-device.c
++++ b/libfprint/fp-device.c
+@@ -19,6 +19,7 @@
+  */
+ 
+ #define FP_COMPONENT "device"
++#include "fpi-sift.h"
+ #include "fpi-log.h"
+ 
+ #include "fp-device-private.h"
+@@ -844,6 +845,12 @@
+       return;
+     }
+ 
++  if (!fpi_sift_configure (device, &error))
++    {
++      g_task_return_error (task, error);
++      return;
++    }
++
+   switch (priv->type)
+     {
+     case FP_DEVICE_TYPE_USB:
+--- a/libfprint/fp-image-device.c
++++ b/libfprint/fp-image-device.c
+@@ -21,6 +21,7 @@
+ #include "fpi-log.h"
+ 
+ #include "fp-image-device-private.h"
++#include "fpi-sift.h"
+ 
+ #define BOZORTH3_DEFAULT_THRESHOLD 40
+ 
+@@ -127,6 +128,8 @@
+       g_object_get (enroll_print, "fpi-type", &print_type, NULL);
+       if (print_type != FPI_PRINT_NBIS)
+         fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
++      if (fpi_sift_enabled (device))
++        fpi_sift_begin (enroll_print);
+     }
+ 
+   priv->enroll_stage = 0;
+--- a/libfprint/fp-print.c
++++ b/libfprint/fp-print.c
+@@ -20,6 +20,7 @@
+ 
+ #define FP_COMPONENT "print"
+ 
++#include "fpi-sift.h"
+ #include "fp-print-private.h"
+ #include "fpi-compat.h"
+ #include "fpi-log.h"
+@@ -664,6 +665,15 @@
+   g_assert (data);
+   g_assert (length);
+ 
++  if (fpi_sift_has_data (print))
++    {
++      *data = NULL;
++      *length = 0;
++      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
++                           "Experimental SIFT templates are process-local");
++      return FALSE;
++    }
++
+   g_variant_builder_add (&builder, "i", print->type);
+   g_variant_builder_add (&builder, "s", print->driver);
+   g_variant_builder_add (&builder, "s", print->device_id);
+--- a/libfprint/fpi-image-device.c
++++ b/libfprint/fpi-image-device.c
+@@ -22,6 +22,7 @@
+ 
+ #include "fp-image-device-private.h"
+ #include "fp-image-device.h"
++#include "fpi-sift.h"
+ 
+ /**
+  * SECTION: fpi-image-device
+@@ -283,7 +284,8 @@
+     {
+       print = fp_print_new (device);
+       fpi_print_set_type (print, FPI_PRINT_NBIS);
+-      if (!fpi_print_add_from_image (print, image, &error))
++      if (!fpi_print_add_from_image (print, image, &error) ||
++          (fpi_sift_enabled (device) && !fpi_sift_add_image (print, image, &error)))
+         {
+           g_clear_object (&print);
+ 
+@@ -304,8 +306,26 @@
+ 
+       if (print)
+         {
+-          fpi_print_add_print (enroll_print, print);
++          if (fpi_sift_enabled (device))
++            {
++              if (!fpi_sift_append (enroll_print, print, &error))
++                {
++                  fp_image_device_maybe_complete_action (self, g_steal_pointer (&error));
++                  fpi_image_device_deactivate (self, TRUE);
++                  return;
++                }
++            }
++          else
++            fpi_print_add_print (enroll_print, print);
+           priv->enroll_stage += 1;
++          if (fpi_sift_enabled (device) &&
++              priv->enroll_stage == fp_device_get_nr_enroll_stages (device) &&
++              !fpi_sift_complete (enroll_print, priv->enroll_stage, &error))
++            {
++              fp_image_device_maybe_complete_action (self, g_steal_pointer (&error));
++              fpi_image_device_deactivate (self, TRUE);
++              return;
++            }
+         }
+ 
+       fpi_device_enroll_progress (device, priv->enroll_stage,
+@@ -333,7 +353,10 @@
+         {
+           FpPrint *template = g_ptr_array_index (templates, i);
+ 
+-          if (fpi_print_bz3_match (template, print, priv->bz3_threshold, &error) == FPI_MATCH_SUCCESS)
++          FpiMatchResult match = fpi_sift_enabled (device) ?
++            fpi_sift_match (template, print, &error) :
++            fpi_print_bz3_match (template, print, priv->bz3_threshold, &error);
++          if (match == FPI_MATCH_SUCCESS)
+             {
+               result = template;
+               break;
+--- a/libfprint/fpi-print.c
++++ b/libfprint/fpi-print.c
+@@ -24,6 +24,7 @@
+ #include "fp-print-private.h"
+ #include "fpi-device.h"
+ #include "fpi-compat.h"
++#include "fpi-sift.h"
+ 
+ /**
+  * SECTION: fpi-print
+@@ -235,6 +236,13 @@
+   gint probe_len;
+   gint i;
+ 
++  if (fpi_sift_has_data (print_template) || fpi_sift_has_data (print))
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
++                           "Experimental SIFT data cannot use the baseline matcher");
++      return FPI_MATCH_ERROR;
++    }
++
+   /* XXX: Use a different error type? */
+   if (print_template->type != FPI_PRINT_NBIS || print->type != FPI_PRINT_NBIS)
+     {
+--- /dev/null
++++ b/libfprint/fpi-sift.c
+@@ -0,0 +1,192 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#define FP_COMPONENT "image_device"
++#include "fpi-log.h"
++#include "fpi-sift.h"
++#include "fpi-image.h"
++
++#define SIFT_DATA "libfprint-experimental-sift-views-v1"
++#define SIFT_ENABLED "libfprint-experimental-sift-enabled-v1"
++#define SIFT_COMPLETE "libfprint-experimental-sift-complete-v1"
++#define MAX_VIEWS 20
++#define MAX_PIXELS 1000000
++
++#include "experimental-sift/bridge.h"
++
++typedef struct {
++  grefcount refs;
++  void *features;
++} SiftView;
++
++static void
++view_unref (gpointer data)
++{
++  SiftView *view = data;
++  if (g_ref_count_dec (&view->refs))
++    {
++      elan_view_free (view->features);
++      g_free (view);
++    }
++}
++
++guint
++fp_experimental_sift_abi (void)
++{
++  return 1;
++}
++
++gboolean
++fpi_sift_hardware_supported (const gchar *driver, guint vid, guint pid, guint revision)
++{
++  return g_strcmp0 (driver, "elan") == 0 && vid == 0x04f3 && pid == 0x0c4d && revision == 0x0187;
++}
++
++gboolean
++fpi_sift_enabled (FpDevice *device)
++{
++  return g_object_get_data (G_OBJECT (device), SIFT_ENABLED) != NULL;
++}
++
++gboolean
++fpi_sift_configure (FpDevice *device, GError **error)
++{
++  GUsbDevice *usb;
++  g_object_set_data (G_OBJECT (device), SIFT_ENABLED, NULL);
++  if (g_strcmp0 (g_getenv ("LIBFPRINT_ELAN_SIFT"), "1") != 0)
++    return TRUE;
++  if (FP_DEVICE_GET_CLASS (device)->type != FP_DEVICE_TYPE_USB)
++    goto unsupported;
++  usb = fpi_device_get_usb_device (device);
++  if (!usb || !fpi_sift_hardware_supported (fp_device_get_driver (device),
++                                            g_usb_device_get_vid (usb),
++                                            g_usb_device_get_pid (usb),
++                                            g_usb_device_get_release (usb)))
++    goto unsupported;
++  g_object_set_data (G_OBJECT (device), SIFT_ENABLED, GINT_TO_POINTER (1));
++  return TRUE;
++unsupported:
++  g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED,
++                       "Experimental SIFT requires ELAN 04f3:0c4d revision 0187");
++  return FALSE;
++}
++
++gboolean
++fpi_sift_has_data (FpPrint *print)
++{
++  return print && g_object_get_data (G_OBJECT (print), SIFT_DATA) != NULL;
++}
++
++void
++fpi_sift_begin (FpPrint *print)
++{
++  g_object_set_data (G_OBJECT (print), SIFT_COMPLETE, NULL);
++  g_object_set_data_full (G_OBJECT (print), SIFT_DATA,
++                          g_ptr_array_new_with_free_func (view_unref),
++                          (GDestroyNotify) g_ptr_array_unref);
++}
++
++guint
++fpi_sift_view_count (FpPrint *print)
++{
++  GPtrArray *views = print ? g_object_get_data (G_OBJECT (print), SIFT_DATA) : NULL;
++  return views ? views->len : 0;
++}
++
++gboolean
++fpi_sift_complete (FpPrint *print, guint expected, GError **error)
++{
++  if (!expected || expected > MAX_VIEWS || fpi_sift_view_count (print) != expected)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
++                           "Incomplete experimental SIFT enrollment");
++      return FALSE;
++    }
++  g_object_set_data (G_OBJECT (print), SIFT_COMPLETE, GINT_TO_POINTER (1));
++  return TRUE;
++}
++
++gboolean
++fpi_sift_add_image (FpPrint *print, FpImage *image, GError **error)
++{
++  void *features;
++  SiftView *view;
++  GPtrArray *views;
++  if (!image || !image->width || !image->height ||
++      image->width > MAX_PIXELS / image->height || fpi_sift_has_data (print))
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
++                           "Invalid experimental SIFT image");
++      return FALSE;
++    }
++  features = elan_view_new (image->data, (gsize) image->width * image->height,
++                            image->width, image->height);
++  if (!features)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                           "Experimental SIFT extraction failed");
++      return FALSE;
++    }
++  if (elan_view_count (features) < 8)
++    {
++      elan_view_free (features);
++      g_set_error_literal (error, FP_DEVICE_RETRY, FP_DEVICE_RETRY_GENERAL,
++                           "Insufficient experimental SIFT features; retry");
++      return FALSE;
++    }
++  view = g_new0 (SiftView, 1);
++  g_ref_count_init (&view->refs);
++  view->features = features;
++  fpi_sift_begin (print);
++  views = g_object_get_data (G_OBJECT (print), SIFT_DATA);
++  g_ptr_array_add (views, view);
++  return TRUE;
++}
++
++gboolean
++fpi_sift_append (FpPrint *stored, FpPrint *scan, GError **error)
++{
++  GPtrArray *views = g_object_get_data (G_OBJECT (stored), SIFT_DATA);
++  GPtrArray *incoming = g_object_get_data (G_OBJECT (scan), SIFT_DATA);
++  SiftView *view;
++  if (!views || views->len >= MAX_VIEWS || !incoming || incoming->len != 1)
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
++                           "Invalid experimental SIFT enrollment");
++      return FALSE;
++    }
++  g_object_set_data (G_OBJECT (stored), SIFT_COMPLETE, NULL);
++  view = g_ptr_array_index (incoming, 0);
++  g_ref_count_inc (&view->refs);
++  g_ptr_array_add (views, view);
++  return TRUE;
++}
++
++FpiMatchResult
++fpi_sift_match (FpPrint *stored, FpPrint *probe, GError **error)
++{
++  GPtrArray *views = stored ? g_object_get_data (G_OBJECT (stored), SIFT_DATA) : NULL;
++  GPtrArray *incoming = probe ? g_object_get_data (G_OBJECT (probe), SIFT_DATA) : NULL;
++  gint best = 0;
++  SiftView *candidate;
++  if (!views || !views->len || views->len > MAX_VIEWS || !incoming || incoming->len != 1 ||
++      !g_object_get_data (G_OBJECT (stored), SIFT_COMPLETE))
++    {
++      g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
++                           "Experimental SIFT requires a live process-local template");
++      return FPI_MATCH_ERROR;
++    }
++  candidate = g_ptr_array_index (incoming, 0);
++  for (guint i = 0; i < views->len; i++)
++    {
++      SiftView *view = g_ptr_array_index (views, i);
++      gint score = elan_view_score (candidate->features, view->features);
++      if (score < 0)
++        {
++          g_set_error_literal (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                               "Experimental SIFT matching failed");
++          return FPI_MATCH_ERROR;
++        }
++      best = MAX (best, score);
++    }
++  fp_dbg ("experimental SIFT score: %d, threshold: 8", best);
++  return best >= 8 ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
++}
+--- /dev/null
++++ b/libfprint/fpi-sift.h
+@@ -0,0 +1,16 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#pragma once
++#include "fpi-device.h"
++#include "fpi-print.h"
++
++guint fp_experimental_sift_abi (void);
++gboolean fpi_sift_hardware_supported (const gchar *driver, guint vid, guint pid, guint revision);
++gboolean fpi_sift_configure (FpDevice *device, GError **error);
++gboolean fpi_sift_enabled (FpDevice *device);
++gboolean fpi_sift_has_data (FpPrint *print);
++gboolean fpi_sift_complete (FpPrint *print, guint expected, GError **error);
++void fpi_sift_begin (FpPrint *print);
++gboolean fpi_sift_add_image (FpPrint *print, FpImage *image, GError **error);
++gboolean fpi_sift_append (FpPrint *stored, FpPrint *scan, GError **error);
++guint fpi_sift_view_count (FpPrint *print);
++FpiMatchResult fpi_sift_match (FpPrint *stored, FpPrint *probe, GError **error);
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -15,6 +15,9 @@
+ ]
+ 
+ libfprint_private_sources = [
++    'fpi-sift.c',
++    'experimental-sift/bridge.cpp',
++    'experimental-sift/reference-sift.cpp',
+     'fpi-assembling.c',
+     'fpi-byte-reader.c',
+     'fpi-byte-writer.c',
+@@ -228,6 +231,8 @@
+     include_directories('nbis/libfprint-include'),
+ ])
+ 
++deps += dependency('opencv4')
++
+ libnbis = static_library('nbis',
+     nbis_sources,
+     dependencies: deps,
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -26,6 +26,18 @@
+ 
+ envs.set('NO_AT_BRIDGE', '1')
+ 
++if get_option('introspection') and 'virtual_image' in drivers
++  sift_envs = envs
++  sift_envs.prepend('GI_TYPELIB_PATH', meson.project_build_root() / 'libfprint')
++  test('sift-image', python3,
++    args: files('sift-image.py'),
++    suite: ['experimental-sift'],
++    env: sift_envs,
++    timeout: 60,
++    depends: [libfprint_typelib],
++  )
++endif
++
+ installed_tests = get_option('installed-tests')
+ installed_tests_execdir = libexecdir / 'installed-tests' / versioned_libname
+ installed_tests_testdir = datadir / 'installed-tests' / versioned_libname
+@@ -309,6 +321,7 @@
+     install: false)
+ 
+ unit_tests = [
++    'fpi-sift',
+     'fpi-device',
+     'fpi-ssm',
+     'fpi-assembling',
+--- /dev/null
++++ b/tests/sift-image.py
+@@ -0,0 +1,115 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: LGPL-2.1-or-later
++import ctypes
++import importlib.util
++import os
++import gc
++import unittest
++from pathlib import Path
++import gi
++
++gi.require_version('FPrint', '2.0')
++from gi.repository import FPrint, GLib, Gio
++
++spec = importlib.util.spec_from_file_location('virtual_image_tests', Path(__file__).with_name('virtual-image.py'))
++virtual = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(virtual)
++virtual.FPrint = FPrint
++
++class SiftImage(virtual.VirtualImage):
++    def setUp(self):
++        super().setUp()
++        gobject = ctypes.CDLL('libgobject-2.0.so.0')
++        gobject.g_object_set_data.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
++        gobject.g_object_set_data(hash(self.dev), b'libfprint-experimental-sift-enabled-v1', 1)
++
++    def test_process_local_enrollment(self):
++        enrolled = self.enroll_print('whorl')
++        with self.assertRaises(GLib.Error) as caught:
++            enrolled.serialize()
++        self.assertTrue(caught.exception.matches(Gio.io_error_quark(), Gio.IOErrorEnum.NOT_SUPPORTED))
++
++    def verify_scan(self, template, image):
++        result = []
++        def completed(device, response):
++            try:
++                result.append(device.verify_finish(response))
++            except GLib.Error as error:
++                result.append(error)
++        self.dev.verify(template, callback=completed)
++        self.wait_for_finger_status(FPrint.FingerStatusFlags.NEEDED)
++        self.send_image(image, dx=2, dy=-1, angle=0.017)
++        while not result:
++            virtual.ctx.iteration(True)
++        return result[0]
++
++    def test_native_genuine_and_control(self):
++        template = self.enroll_print('whorl')
++        genuine = self.verify_scan(template, 'whorl')
++        control = self.verify_scan(template, 'tented_arch')
++        self.assertTrue(genuine[0])
++        self.assertFalse(control[0])
++
++    def test_cancel_then_close(self):
++        cancellable = Gio.Cancellable()
++        result = []
++        def completed(device, response):
++            try:
++                device.enroll_finish(response)
++            except GLib.Error as error:
++                result.append(error)
++        template = FPrint.Print.new(self.dev)
++        released = []
++        template.weak_ref(lambda: released.append(True))
++        progress = []
++        self.dev.enroll(template, cancellable, lambda dev, step, scan, data: progress.append(step), (), completed)
++        self.wait_for_finger_status(FPrint.FingerStatusFlags.NEEDED)
++        self.send_image('whorl')
++        while not progress:
++            virtual.ctx.iteration(True)
++        self.assertEqual(progress, [1])
++        cancellable.cancel()
++        while not result:
++            virtual.ctx.iteration(True)
++        self.assertTrue(result[0].matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED))
++        self.assertEqual(self.dev.get_finger_status(), FPrint.FingerStatusFlags.NONE)
++        result.clear()
++        del template
++        gc.collect()
++        while virtual.ctx.pending():
++            virtual.ctx.iteration(False)
++        self.assertEqual(released, [True])
++
++    def test_legacy_template_rejected(self):
++        gobject = ctypes.CDLL('libgobject-2.0.so.0')
++        gobject.g_object_set_data.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
++        gobject.g_object_set_data(hash(self.dev), b'libfprint-experimental-sift-enabled-v1', None)
++        template = FPrint.Print.deserialize(self.enroll_print('whorl').serialize())
++        gobject.g_object_set_data(hash(self.dev), b'libfprint-experimental-sift-enabled-v1', 1)
++        result = self.verify_scan(template, 'whorl')
++        self.assertIsInstance(result, GLib.Error)
++        self.assertTrue(result.matches(FPrint.device_error_quark(), FPrint.DeviceError.DATA_INVALID))
++
++    def test_verify_cancel(self):
++        template = self.enroll_print('whorl')
++        cancellable = Gio.Cancellable()
++        result = []
++        def completed(device, response):
++            try:
++                device.verify_finish(response)
++            except GLib.Error as error:
++                result.append(error)
++        self.dev.verify(template, cancellable, callback=completed)
++        self.wait_for_finger_status(FPrint.FingerStatusFlags.NEEDED)
++        cancellable.cancel()
++        while not result:
++            virtual.ctx.iteration(True)
++        self.assertTrue(result[0].matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED))
++        self.assertEqual(self.dev.get_finger_status(), FPrint.FingerStatusFlags.NONE)
++
++if __name__ == '__main__':
++    suite = unittest.TestSuite(SiftImage(name) for name in (
++        'test_process_local_enrollment', 'test_native_genuine_and_control', 'test_cancel_then_close',
++        'test_legacy_template_rejected', 'test_verify_cancel'))
++    result = unittest.TextTestRunner(verbosity=2).run(suite)
++    raise SystemExit(not result.wasSuccessful())
+--- /dev/null
++++ b/tests/test-fpi-sift.c
+@@ -0,0 +1,283 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "fpi-sift.h"
++#include "fpi-image.h"
++#include "fp-print-private.h"
++#include "test-device-fake.h"
++
++static FpPrint *
++new_print (FpDevice *device)
++{
++  FpPrint *print = fp_print_new (device);
++  g_object_ref_sink (print);
++  fpi_print_set_type (print, FPI_PRINT_NBIS);
++  return print;
++}
++
++static FpImage *
++texture (guint seed)
++{
++  FpImage *image = fp_image_new (150, 100);
++  GRand *rng = g_rand_new_with_seed (seed);
++  for (guint i = 0; i < 150 * 100; i++)
++    image->data[i] = g_rand_int_range (rng, 0, 256);
++  g_rand_free (rng);
++  return image;
++}
++
++static void
++test_guard (void)
++{
++  g_assert_cmpuint (fp_experimental_sift_abi (), ==, 1);
++  g_assert_true (fpi_sift_hardware_supported ("elan", 0x04f3, 0x0c4d, 0x0187));
++  g_assert_false (fpi_sift_hardware_supported ("elan", 0x04f3, 0x0c4d, 0x2410));
++  g_assert_false (fpi_sift_hardware_supported ("elan", 0x04f3, 0x0c4e, 0x0187));
++  g_assert_false (fpi_sift_hardware_supported ("elan", 0x04f4, 0x0c4d, 0x0187));
++  g_assert_false (fpi_sift_hardware_supported ("virtual_image", 0x04f3, 0x0c4d, 0x0187));
++  g_assert_false (fpi_sift_hardware_supported (NULL, 0x04f3, 0x0c4d, 0x0187));
++}
++
++static void
++test_template_lifetime (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) stored = new_print (device);
++  g_autoptr(FpPrint) scan = new_print (device);
++  g_autoptr(FpPrint) probe = new_print (device);
++  g_autoptr(FpImage) image = texture (123);
++  g_autoptr(GError) error = NULL;
++  fpi_sift_begin (stored);
++  g_assert_true (fpi_sift_add_image (scan, image, &error));
++  g_assert_true (fpi_sift_append (stored, scan, &error));
++  g_clear_object (&scan);
++  g_assert_true (fpi_sift_add_image (probe, image, &error));
++  g_assert_true (fpi_sift_complete (stored, 1, &error));
++  g_assert_cmpint (fpi_sift_match (stored, probe, &error), ==, FPI_MATCH_SUCCESS);
++  g_assert_cmpuint (fpi_sift_view_count (stored), ==, 1);
++  g_assert_no_error (error);
++}
++
++static void
++test_unrelated_rejected (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) stored = new_print (device);
++  g_autoptr(FpPrint) probe = new_print (device);
++  g_autoptr(FpImage) first = texture (123);
++  g_autoptr(FpImage) second = texture (456);
++  g_autoptr(GError) error = NULL;
++  g_assert_true (fpi_sift_add_image (stored, first, &error));
++  g_assert_true (fpi_sift_add_image (probe, second, &error));
++  g_assert_true (fpi_sift_complete (stored, 1, &error));
++  g_assert_cmpint (fpi_sift_match (stored, probe, &error), ==, FPI_MATCH_FAIL);
++  g_assert_no_error (error);
++}
++
++static void
++test_missing_template_rejected (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) legacy = new_print (device);
++  g_autoptr(FpPrint) probe = new_print (device);
++  g_autoptr(FpImage) image = texture (123);
++  g_autoptr(GError) error = NULL;
++  g_assert_true (fpi_sift_add_image (probe, image, &error));
++  g_assert_cmpint (fpi_sift_match (legacy, probe, &error), ==, FPI_MATCH_ERROR);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++}
++
++static void
++test_blank_retry (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) print = new_print (device);
++  g_autoptr(FpImage) image = fp_image_new (150, 100);
++  g_autoptr(GError) error = NULL;
++  g_assert_false (fpi_sift_add_image (print, image, &error));
++  g_assert_error (error, FP_DEVICE_RETRY, FP_DEVICE_RETRY_GENERAL);
++}
++
++static void
++test_serialization_rejected (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) print = new_print (device);
++  g_autoptr(GError) error = NULL;
++  g_autofree guchar *data = NULL;
++  gsize length = 0;
++  fpi_sift_begin (print);
++  g_assert_false (fp_print_serialize (print, &data, &length, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED);
++  g_assert_null (data);
++  g_assert_cmpuint (length, ==, 0);
++}
++
++static void
++test_view_limit (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) stored = new_print (device);
++  g_autoptr(FpPrint) scan = new_print (device);
++  g_autoptr(FpImage) image = texture (123);
++  g_autoptr(GError) error = NULL;
++  fpi_sift_begin (stored);
++  g_assert_true (fpi_sift_add_image (scan, image, &error));
++  for (guint i = 0; i < 20; i++)
++    g_assert_true (fpi_sift_append (stored, scan, &error));
++  g_assert_false (fpi_sift_append (stored, scan, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++  g_assert_cmpuint (fpi_sift_view_count (stored), ==, 20);
++}
++
++static void
++test_partial_template_rejected (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) stored = new_print (device);
++  g_autoptr(FpPrint) probe = new_print (device);
++  g_autoptr(FpImage) image = texture (123);
++  g_autoptr(GError) error = NULL;
++  g_assert_true (fpi_sift_add_image (stored, image, &error));
++  g_assert_true (fpi_sift_add_image (probe, image, &error));
++  g_assert_cmpint (fpi_sift_match (stored, probe, &error), ==, FPI_MATCH_ERROR);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++}
++
++static void
++test_baseline_rejects_candidate (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) stored = new_print (device);
++  g_autoptr(FpPrint) probe = new_print (device);
++  g_autoptr(GError) error = NULL;
++  fpi_sift_begin (stored);
++  g_assert_cmpint (fpi_print_bz3_match (stored, probe, 24, &error), ==, FPI_MATCH_ERROR);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++}
++
++static void
++test_nonusb_configure (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(GError) error = NULL;
++  g_unsetenv ("LIBFPRINT_ELAN_SIFT");
++  g_assert_true (fpi_sift_configure (device, &error));
++  g_assert_false (fpi_sift_enabled (device));
++  g_setenv ("LIBFPRINT_ELAN_SIFT", "1", TRUE);
++  g_assert_false (fpi_sift_configure (device, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED);
++  g_assert_false (fpi_sift_enabled (device));
++  g_unsetenv ("LIBFPRINT_ELAN_SIFT");
++}
++
++static void
++test_open_guard (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(GError) error = NULL;
++  g_setenv ("LIBFPRINT_ELAN_SIFT", "1", TRUE);
++  g_assert_false (fp_device_open_sync (device, NULL, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_NOT_SUPPORTED);
++  g_assert_false (fp_device_is_open (device));
++  g_unsetenv ("LIBFPRINT_ELAN_SIFT");
++}
++
++static void
++test_invalid_image (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) print = new_print (device);
++  g_autoptr(FpImage) image = fp_image_new (1, 1);
++  g_autoptr(GError) error = NULL;
++  image->width = G_MAXUINT;
++  image->height = G_MAXUINT;
++  g_assert_false (fpi_sift_add_image (print, image, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++}
++
++static void
++test_incomplete_mark_rejected (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) print = new_print (device);
++  g_autoptr(GError) error = NULL;
++  fpi_sift_begin (print);
++  g_assert_false (fpi_sift_complete (print, 5, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++}
++
++static void
++test_legacy_roundtrip_rejected (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) legacy = new_print (device);
++  g_autoptr(FpPrint) probe = new_print (device);
++  g_autoptr(FpPrint) restored = NULL;
++  g_autoptr(FpImage) image = texture (123);
++  g_autoptr(GError) error = NULL;
++  g_autofree guchar *data = NULL;
++  gsize length = 0;
++  g_assert_true (fp_print_serialize (legacy, &data, &length, &error));
++  restored = fp_print_deserialize (data, length, &error);
++  g_assert_nonnull (restored);
++  g_assert_true (fpi_sift_add_image (probe, image, &error));
++  g_assert_cmpint (fpi_sift_match (restored, probe, &error), ==, FPI_MATCH_ERROR);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++}
++
++static void
++test_malformed_lifecycle (void)
++{
++  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) print = new_print (device);
++  g_autoptr(FpPrint) missing = new_print (device);
++  g_autoptr(FpImage) image = texture (123);
++  g_autoptr(GError) error = NULL;
++  g_assert_false (fpi_sift_add_image (print, NULL, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++  g_clear_error (&error);
++  g_assert_true (fpi_sift_add_image (print, image, &error));
++  g_assert_false (fpi_sift_add_image (print, image, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++  g_clear_error (&error);
++  g_assert_false (fpi_sift_complete (print, 0, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++  g_clear_error (&error);
++  g_assert_false (fpi_sift_complete (print, 21, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++  g_clear_error (&error);
++  g_assert_false (fpi_sift_append (missing, print, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++  g_clear_error (&error);
++  g_assert_false (fpi_sift_append (print, missing, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++  g_clear_error (&error);
++  g_assert_true (fpi_sift_complete (print, 1, &error));
++  g_assert_cmpint (fpi_sift_match (print, NULL, &error), ==, FPI_MATCH_ERROR);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++  g_clear_error (&error);
++  g_assert_cmpint (fpi_sift_match (NULL, print, &error), ==, FPI_MATCH_ERROR);
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID);
++  g_assert_cmpuint (fpi_sift_view_count (NULL), ==, 0);
++}
++
++int
++main (int argc, char **argv)
++{
++  g_test_init (&argc, &argv, NULL);
++  g_test_add_func ("/sift/guard", test_guard);
++  g_test_add_func ("/sift/malformed-lifecycle", test_malformed_lifecycle);
++  g_test_add_func ("/sift/open-guard", test_open_guard);
++  g_test_add_func ("/sift/invalid-image", test_invalid_image);
++  g_test_add_func ("/sift/incomplete-mark", test_incomplete_mark_rejected);
++  g_test_add_func ("/sift/legacy-roundtrip", test_legacy_roundtrip_rejected);
++  g_test_add_func ("/sift/partial-template", test_partial_template_rejected);
++  g_test_add_func ("/sift/baseline-rejects-candidate", test_baseline_rejects_candidate);
++  g_test_add_func ("/sift/nonusb-configure", test_nonusb_configure);
++  g_test_add_func ("/sift/template-lifetime", test_template_lifetime);
++  g_test_add_func ("/sift/unrelated", test_unrelated_rejected);
++  g_test_add_func ("/sift/missing-template", test_missing_template_rejected);
++  g_test_add_func ("/sift/blank", test_blank_retry);
++  g_test_add_func ("/sift/serialization", test_serialization_rejected);
++  g_test_add_func ("/sift/view-limit", test_view_limit);
++  return g_test_run ();
++}
