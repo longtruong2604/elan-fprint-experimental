@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "libfprint_version": "1.94.100",
+  "base_source_url": "https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v1.94.100/libfprint-v1.94.100.tar.gz",
+  "fedora_source_rpm_url": "https://kojipkgs.fedoraproject.org/packages/libfprint/1.94.100/1.fc44/src/libfprint-1.94.100-1.fc44.src.rpm",
+  "matcher_reference_commit": "bc4d6a594cefea17a55e739c752495ea5a52d0ab",
+  "patches": [
+    "patches/01-observation.patch",
+    "patches/02-sift.patch",
+    "patches/03-persistence.patch"
+  ],
+  "sha256": {
+    "sources/libfprint-v1.94.100.tar.gz": "edc90e02f330a7595ceaf37f2c6ec32ed43541347fe936d3273b0bb2524fd19c",
+    "patches/01-observation.patch": "e6dee6e057af9052ca6e28f775fc6535076e881fe278ac236d664b0c8f52343c",
+    "patches/02-sift.patch": "65ee5153b6381cea3b16b2eed0e554f28a502f435d098d220d34ac342a4b006e",
+    "patches/03-persistence.patch": "a27bb3a8fddacf393e7a298beb1aa93f2a272a9986e1b9eb8c113d5a5404adc7",
+    "manage.py.in": "6a9fd439d56be9e16be6fbb3a31a9eba402d99ee2d7b2cb457e2ca78549f5581"
+  }
+}

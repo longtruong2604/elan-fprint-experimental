@@ -1,0 +1,403 @@
+#!/usr/bin/python3 -I
+"""Install or retire the pinned ELAN persistence library for system fprintd.
+
+Run with /usr/bin/python3 -I through sudo. This never enrolls a finger or
+changes PAM, authselect, package libraries, or /var/lib/fprint.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+
+LIBRARY_SHA256 = "@LIBRARY_SHA256@"
+VERSION = Path("/usr/local/lib/elan-fprint") / LIBRARY_SHA256
+LIBDIR = VERSION / "lib64"
+LIBRARY = LIBDIR / "libfprint-2.so.2.0.0"
+SONAME = LIBDIR / "libfprint-2.so.2"
+MANAGER = VERSION / "manage.py"
+STATE_DIR = Path("/var/lib/elan-fprint-deployment") / LIBRARY_SHA256
+STATE = STATE_DIR / "state.json"
+DROPIN_DIR = Path("/etc/systemd/system/fprintd.service.d")
+DROPIN = DROPIN_DIR / "90-elan-sift-persist.conf"
+UNIT = "fprintd.service"
+DROPIN_BYTES = (
+    "# Managed by fingerprint-diagnostic/deployment/manage.py\n"
+    "# Retire through the recorded rollback command; preserve package libraries.\n"
+    "[Service]\n"
+    f'Environment="LD_LIBRARY_PATH={LIBDIR}:/usr/lib64"\n'
+    'Environment="LIBFPRINT_ELAN_SIFT=1"\n'
+).encode("ascii")
+CHILD_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"}
+
+
+class DeploymentError(Exception):
+    pass
+
+
+def fail(message: str) -> None:
+    raise DeploymentError(message)
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_regular(path: Path, limit: int = 8 * 1024 * 1024) -> bytes:
+    """Pin an opened inode, reject final symlinks, and bound untrusted input."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            fail(f"Expected a regular file no larger than {limit} bytes: {path}")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read(limit + 1)
+        if len(data) > limit:
+            fail(f"File grew beyond its size limit: {path}")
+        return data
+    finally:
+        os.close(fd)
+
+
+def trusted(path: Path, directory: bool = True) -> os.stat_result:
+    """Every system destination component must resist unprivileged replacement."""
+    for component in (Path("/"), *reversed(path.parents), path):
+        info = component.lstat()
+        expected_directory = component != path or directory
+        correct_type = stat.S_ISDIR(info.st_mode) if expected_directory else stat.S_ISREG(info.st_mode)
+        if not correct_type or info.st_uid != 0 or info.st_gid != 0 or info.st_mode & 0o022:
+            fail(f"Refusing symlink, wrong ownership/type or writable system path: {component}")
+        if not expected_directory and info.st_nlink != 1:
+            fail(f"Refusing hard-linked managed file: {component}")
+    return info
+
+
+def ensure_dir(path: Path, mode: int = 0o755) -> None:
+    if not path.exists() and not path.is_symlink():
+        trusted(path.parent)
+        path.mkdir(mode=mode)
+        os.chown(path, 0, 0)
+        os.chmod(path, mode)
+    info = trusted(path)
+    if stat.S_IMODE(info.st_mode) != mode:
+        fail(f"Expected mode {mode:04o}; refusing to change an existing directory: {path}")
+
+
+def atomic_write(path: Path, data: bytes, mode: int, *, replace: bool = False) -> None:
+    trusted(path.parent)
+    if path.exists() or path.is_symlink():
+        trusted(path, directory=False)
+        if not replace:
+            if read_regular(path) != data or stat.S_IMODE(path.stat().st_mode) != mode:
+                fail(f"Existing managed file differs; refusing overwrite: {path}")
+            return
+    fd, name = tempfile.mkstemp(prefix=".elan-install-", dir=path.parent)
+    try:
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if replace:
+            os.replace(name, path)
+        else:
+            # link() fails rather than replacing a concurrently created destination.
+            os.link(name, path, follow_symlinks=False)
+            os.unlink(name)
+    finally:
+        if os.path.lexists(name):
+            os.unlink(name)
+
+
+def run(*args: str) -> str:
+    result = subprocess.run(args, env=CHILD_ENV, cwd="/", text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    if result.returncode:
+        fail(f"Command failed ({result.returncode}): {shlex.join(args)}\n{result.stderr.strip()}")
+    return result.stdout
+
+
+def systemctl(*args: str) -> str:
+    return run("/usr/bin/systemctl", *args)
+
+
+def properties() -> dict[str, str]:
+    names = ("ActiveState", "SubState", "UnitFileState", "FragmentPath", "DropInPaths",
+             "Environment", "EnvironmentFiles", "MainPID", "ProtectHome", "ProtectSystem",
+             "StateDirectory", "StateDirectoryMode", "ExecStart")
+    lines = systemctl("show", UNIT, *[f"--property={name}" for name in names])
+    return dict(line.split("=", 1) for line in lines.splitlines() if "=" in line)
+
+
+def inspect_service(*, installed: bool) -> dict[str, str]:
+    current = properties()
+    if current.get("ActiveState") not in {"active", "inactive"}:
+        fail(f"Service must be active or inactive, not {current.get('ActiveState')!r}")
+    if current.get("FragmentPath") != "/usr/lib/systemd/system/fprintd.service":
+        fail("The fprintd unit is replaced or masked; inspect it before deployment")
+    if "path=/usr/libexec/fprintd ;" not in current.get("ExecStart", ""):
+        fail("The fprintd ExecStart is customized; inspect it before deployment")
+    if (current.get("ProtectHome") != "yes" or current.get("ProtectSystem") != "strict"
+            or current.get("StateDirectory") != "fprint"
+            or current.get("StateDirectoryMode") != "0700"):
+        fail("Unexpected fprintd sandbox/storage settings; refusing to weaken them")
+    if current.get("EnvironmentFiles"):
+        fail("fprintd has EnvironmentFile overrides; inspect loader conflicts before deployment")
+    env = dict(item.split("=", 1) for item in shlex.split(current.get("Environment", "")) if "=" in item)
+    expected = {"LD_LIBRARY_PATH": f"{LIBDIR}:/usr/lib64", "LIBFPRINT_ELAN_SIFT": "1"}
+    for key, value in expected.items():
+        if installed:
+            if env.get(key) != value:
+                fail(f"The effective {key} conflicts with this deployment")
+        elif key in env:
+            fail(f"Existing {key} would be replaced; refusing unmanaged loader configuration")
+    if env.get("LD_PRELOAD") or env.get("LD_AUDIT"):
+        fail("fprintd has another loader override; inspect it before deployment")
+    return current
+
+
+def write_state(state: dict) -> None:
+    atomic_write(STATE, (json.dumps(state, indent=2, sort_keys=True) + "\n").encode(),
+                 0o600, replace=True)
+
+
+def load_state() -> dict | None:
+    if not STATE.exists() and not STATE.is_symlink():
+        return None
+    trusted(STATE, directory=False)
+    state = json.loads(read_regular(STATE, 256 * 1024))
+    if (state.get("schema") != 1 or state.get("library_sha256") != LIBRARY_SHA256
+            or state.get("prior_active_state") not in {"active", "inactive"}
+            or state.get("status") not in {"prepared", "installed", "rolled-back", "failed"}):
+        fail("Invalid deployment state; refusing automatic changes")
+    return state
+
+
+def check_managed_dropin(*, required: bool) -> bool:
+    if not DROPIN.exists() and not DROPIN.is_symlink():
+        if required:
+            fail(f"Managed drop-in was removed externally: {DROPIN}")
+        return False
+    trusted(DROPIN, directory=False)
+    if read_regular(DROPIN) != DROPIN_BYTES or stat.S_IMODE(DROPIN.stat().st_mode) != 0o644:
+        fail(f"Managed drop-in changed externally; refusing overwrite/removal: {DROPIN}")
+    return True
+
+
+def check_library() -> None:
+    trusted(LIBRARY, directory=False)
+    if digest(read_regular(LIBRARY)) != LIBRARY_SHA256 or stat.S_IMODE(LIBRARY.stat().st_mode) != 0o644:
+        fail(f"Installed library differs from the pinned bytes or permissions: {LIBRARY}")
+    trusted(SONAME.parent)
+    info = SONAME.lstat()
+    if (not stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+            or os.readlink(SONAME) != LIBRARY.name):
+        fail(f"Unexpected SONAME link: {SONAME}")
+
+
+def restore_service(prior: str) -> None:
+    if prior == "active":
+        systemctl("start", UNIT)
+    else:
+        systemctl("stop", UNIT)
+
+
+def rollback(state: dict) -> None:
+    """Remove only our unchanged override; retain all normal fingerprint data."""
+    present = check_managed_dropin(required=state["status"] == "installed")
+    if state["status"] == "rolled-back":
+        if present:
+            fail("Drop-in reappeared after rollback; inspect the external change")
+        print("Already rolled back; service and user fingerprints left untouched.")
+        return
+    systemctl("stop", UNIT)
+    if present:
+        DROPIN.unlink()
+    systemctl("daemon-reload")
+    restore_service(state["prior_active_state"])
+    state["status"] = "rolled-back"
+    state["rolled_back_at"] = datetime.now(timezone.utc).isoformat()
+    write_state(state)
+    print("Rolled back the managed override and restored the prior service state.")
+    print("Versioned library/snapshots retained. /var/lib/fprint and PAM were not modified.")
+
+
+def activation() -> dict:
+    systemctl("daemon-reload")
+    inspect_service(installed=True)
+    systemctl("stop", UNIT)
+    systemctl("start", UNIT)
+    current = properties()
+    pid = int(current.get("MainPID", "0"))
+    if pid <= 0:
+        fail("fprintd did not retain a process after activation")
+    mapped = []
+    for line in Path(f"/proc/{pid}/maps").read_text().splitlines():
+        parts = line.split(maxsplit=5)
+        if len(parts) == 6 and "libfprint-2.so" in parts[5]:
+            mapped.append(parts[5])
+    if not mapped or set(mapped) != {str(LIBRARY)}:
+        fail(f"fprintd mapped unexpected libfprint paths: {sorted(set(mapped))}")
+    return {"pid_at_activation": pid, "mapped_library": str(LIBRARY),
+            "active_state": current["ActiveState"], "observed_at": datetime.now(timezone.utc).isoformat()}
+
+
+def print_commands() -> None:
+    print("Enroll from your normal terminal (no sudo):")
+    print("  fprintd-enroll -f right-index-finger")
+    print("Rollback:")
+    print(f"  sudo /usr/bin/python3 -I {MANAGER} rollback")
+
+
+def require_supported_host() -> None:
+    release = {}
+    for line in Path("/etc/os-release").read_text().splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            release[key] = value.strip('"')
+    if release.get("ID") != "fedora" or release.get("VERSION_ID") != "44" or os.uname().machine != "x86_64":
+        fail("This experimental installer is scoped to Fedora 44 x86_64")
+    found = []
+    for device in Path("/sys/bus/usb/devices").iterdir():
+        try:
+            identity = tuple((device / name).read_text().strip().lower()
+                             for name in ("idVendor", "idProduct", "bcdDevice"))
+        except FileNotFoundError:
+            continue
+        if identity[:2] == ("04f3", "0c4d"):
+            found.append(identity[2])
+    if found != ["0187"]:
+        fail("Connect exactly one ELAN 04f3:0c4d revision 0187; other revisions are unsupported")
+
+
+def install(library_bytes: bytes, manager_bytes: bytes, state: dict | None) -> None:
+    if state and state["status"] == "installed":
+        check_managed_dropin(required=True)
+        check_library()
+        inspect_service(installed=True)
+        trusted(MANAGER, directory=False)
+        if (digest(read_regular(MANAGER)) != state["manager_sha256"]
+                or stat.S_IMODE(MANAGER.stat().st_mode) != 0o755):
+            fail("The installed rollback manager changed externally; inspect it before proceeding")
+        print("Already installed with the expected hash and effective service environment.")
+        print_commands()
+        return
+    if DROPIN.exists() or DROPIN.is_symlink():
+        fail(f"Existing unmanaged or interrupted drop-in; inspect/rollback before install: {DROPIN}")
+    require_supported_host()
+    previous = inspect_service(installed=False)
+    previous_unit = systemctl("cat", UNIT).encode()
+    for path in (Path("/usr/local/lib/elan-fprint"), VERSION, LIBDIR):
+        ensure_dir(path)
+    ensure_dir(DROPIN_DIR)
+    atomic_write(LIBRARY, library_bytes, 0o644)
+    atomic_write(MANAGER, manager_bytes, 0o755)
+    if SONAME.exists() or SONAME.is_symlink():
+        check_library()
+    else:
+        SONAME.symlink_to(LIBRARY.name)
+    check_library()
+    # Standard labels retain SELinux's policy; no policy or sandbox relaxation.
+    run("/usr/bin/restorecon", "-R", str(VERSION))
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    snapshot = STATE_DIR / f"before-{stamp}.json"
+    state = {"schema": 1, "library_sha256": LIBRARY_SHA256, "status": "prepared",
+             "prepared_at": datetime.now(timezone.utc).isoformat(),
+             "prior_active_state": previous["ActiveState"], "prior_service": previous,
+             "prior_dropin": "absent", "prior_unit_snapshot": previous_unit.decode(),
+             "snapshot_file": str(snapshot), "dropin_sha256": digest(DROPIN_BYTES),
+             "manager_sha256": digest(manager_bytes)}
+    atomic_write(snapshot, (json.dumps(state, indent=2, sort_keys=True) + "\n").encode(), 0o600)
+    write_state(state)
+    dropin_written = False
+    try:
+        # Do not overwrite configuration changed since the pre-install snapshot.
+        if systemctl("cat", UNIT).encode() != previous_unit:
+            fail("Service configuration changed during preparation; refusing to activate")
+        atomic_write(DROPIN, DROPIN_BYTES, 0o644)
+        dropin_written = True
+        run("/usr/bin/restorecon", str(DROPIN_DIR), str(DROPIN))
+        state["activation"] = activation()
+        state["status"] = "installed"
+        write_state(state)
+    except (Exception, KeyboardInterrupt):
+        if not dropin_written:
+            state["status"] = "failed"
+            write_state(state)
+            raise
+        print("Installation did not complete; attempting scoped rollback.", file=sys.stderr)
+        try:
+            rollback(state)
+        except Exception as recovery_error:
+            state["status"] = "failed"
+            write_state(state)
+            print(f"Automatic rollback incomplete: {recovery_error}", file=sys.stderr)
+            print(f"Recovery: sudo /usr/bin/python3 -I {MANAGER} rollback", file=sys.stderr)
+        raise
+    print(f"Installed {LIBRARY_SHA256} for system fprintd; runtime mapping recorded in {STATE}.")
+    print("PAM/authselect and existing enrollments preserved. fprintd remains on-demand (not enabled).")
+    print_commands()
+
+
+def main() -> None:
+    if len(sys.argv) not in {2, 3} or sys.argv[1] not in {"install", "rollback", "status"}:
+        fail("Usage: sudo /usr/bin/python3 -I deployment/manage.py install [library-file] | rollback | status")
+    if sys.argv[1] != "install" and len(sys.argv) != 2:
+        fail("Only install accepts a library file")
+    if os.geteuid() != 0:
+        fail("Run this installer in your terminal through sudo /usr/bin/python3 -I; no password is read here")
+    os.umask(0o077)
+    manager_path = Path(__file__).absolute()
+    manager_bytes = read_regular(manager_path)
+    source = Path(sys.argv[2]).absolute() if len(sys.argv) == 3 else (
+        LIBRARY if manager_path == MANAGER else manager_path.parent / "libfprint-2.so.2.0.0")
+    # Source authentication occurs even before creating the root-owned lock/state.
+    library_bytes = b""
+    if sys.argv[1] == "install":
+        library_bytes = read_regular(source)
+        if digest(library_bytes) != LIBRARY_SHA256:
+            fail("Source library SHA-256 differs from the pinned persistence build")
+    trusted(Path("/usr/local/lib"))
+    trusted(Path("/etc/systemd/system"))
+    trusted(Path("/var/lib"))
+    if sys.argv[1] == "status" and not STATE_DIR.exists():
+        print("Not installed: no managed deployment state exists.")
+        return
+    ensure_dir(STATE_DIR.parent, 0o700)
+    ensure_dir(STATE_DIR, 0o700)
+    lock_path = STATE_DIR / "lock"
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        trusted(lock_path, directory=False)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        state = load_state()
+        if sys.argv[1] == "status":
+            print(json.dumps(state, indent=2, sort_keys=True) if state else "Not installed.")
+            print(systemctl("show", UNIT, "--property=ActiveState", "--property=Environment"), end="")
+        elif sys.argv[1] == "rollback":
+            if state is None:
+                fail("No managed deployment state; refusing to touch the service")
+            rollback(state)
+        else:
+            install(library_bytes, manager_bytes, state)
+    finally:
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (DeploymentError, OSError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+        print(f"ELAN deployment stopped: {error}", file=sys.stderr)
+        sys.exit(1)

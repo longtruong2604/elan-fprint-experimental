@@ -1,0 +1,73 @@
+--- a/libfprint/drivers/elan.c
++++ b/libfprint/drivers/elan.c
+@@ -355,6 +355,25 @@
+ 
+   G_DEBUG_HERE ();
+ 
++  /* Keep image contents private: log lengths, and only scalar status replies. */
++  if (self->cmd)
++    {
++      fp_dbg ("ELAN_DIAG transfer t_us=%" G_GINT64_FORMAT
++              " cmd=%02x%02x ep=%02x expected=%" G_GSSIZE_FORMAT
++              " actual=%" G_GSSIZE_FORMAT " error=%d",
++              g_get_monotonic_time (), self->cmd->cmd[0], self->cmd->cmd[1],
++              transfer->endpoint, transfer->length, transfer->actual_length,
++              error != NULL);
++      if (!error && (transfer->endpoint & FPI_USB_ENDPOINT_IN) &&
++          transfer->buffer && transfer->actual_length > 0 &&
++          (self->cmd == &get_calib_status_cmd || self->cmd == &pre_scan_cmd ||
++           self->cmd == &read_sensor_status_cmd))
++        fp_dbg ("ELAN_DIAG status t_us=%" G_GINT64_FORMAT
++                " cmd=%02x%02x value=%02x",
++                g_get_monotonic_time (), self->cmd->cmd[0], self->cmd->cmd[1],
++                transfer->buffer[0]);
++    }
++
+   if (error)
+     {
+       /* XXX: In the cancellation case we used to not
+@@ -492,6 +511,8 @@
+ 
+   G_DEBUG_HERE ();
+ 
++  fp_dbg ("ELAN_DIAG marker t_us=%" G_GINT64_FORMAT " stage=stop-complete",
++          g_get_monotonic_time ());
+ 
+   /* The device is inactive at this point. */
+   self->active = FALSE;
+@@ -654,6 +675,7 @@
+     elandev->last_read[0] * 0xff + elandev->last_read[1];
+   unsigned int bg_mean = 0, delta;
+   unsigned int frame_size = elandev->frame_width * elandev->frame_height;
++  unsigned int diag_zero_pixels = 0, diag_high_pixels = 0;
+ 
+   g_assert (frame_size != 0);
+ 
+@@ -668,8 +690,16 @@
+     }
+ 
+   for (int i = 0; i < frame_size; i++)
+-    bg_mean += elandev->background[i];
++    {
++      bg_mean += elandev->background[i];
++      diag_zero_pixels += elandev->background[i] == 0;
++      diag_high_pixels += elandev->background[i] >= 0x3ffe;
++    }
+   bg_mean /= frame_size;
++
++  fp_dbg ("ELAN_DIAG background t_us=%" G_GINT64_FORMAT
++          " pixels=%u zero=%u high=%u",
++          g_get_monotonic_time (), frame_size, diag_zero_pixels, diag_high_pixels);
+ 
+   delta =
+     bg_mean > calib_mean ? bg_mean - calib_mean : calib_mean - bg_mean;
+@@ -808,6 +838,9 @@
+ {
+   G_DEBUG_HERE ();
+ 
++  fp_dbg ("ELAN_DIAG marker t_us=%" G_GINT64_FORMAT " stage=calibration-start",
++          g_get_monotonic_time ());
++
+   elan_dev_reset_state (self);
+ 
+   g_return_if_fail (!self->active);
